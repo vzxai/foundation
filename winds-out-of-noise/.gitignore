@@ -1,0 +1,5 @@
+# renders, caches and downloaded films live outside the repo
+*.mp4
+*.wav
+*.part
+__pycache__/
