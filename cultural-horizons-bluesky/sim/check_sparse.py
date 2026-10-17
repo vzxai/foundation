@@ -60,7 +60,7 @@ def main():
         perturb(d, np.random.default_rng(s))
         for f in FLAGS:
             run(os.path.join(PIPE, "build_panel.py"), d, d + "/dense.parquet", *f)
-            run(os.path.join(PIPE, "build_panel_sparse.py"), d, d + "/sparse.parquet", *f)
+            run(os.path.join(PIPE, "build_panel_sparse.py"), d, d + "/sparse.parquet", *f, "--buckets", "3")
             for ch in ("y_direct", "y_copy"):
                 x, y = table(d + "/dense.parquet", ch), table(d + "/sparse.parquet", ch)
                 idx = x.index.union(y.index)

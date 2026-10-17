@@ -22,6 +22,8 @@ Usage: python -I build_panel_sparse.py DATA_DIR OUT.parquet [same flags as build
 DATA_DIR may be an http(s) URL prefix; DuckDB then reads only the needed columns.
 """
 import argparse
+import os
+import shutil
 
 import duckdb
 
@@ -39,6 +41,7 @@ def main():
     ap.add_argument("--memory", default="8GB")
     ap.add_argument("--temp-dir", default=None, help="DuckDB spill directory")
     ap.add_argument("--placebo-shift", type=float, default=0)
+    ap.add_argument("--buckets", type=int, default=1, help="run the per-target stages in this many target buckets")
     a = ap.parse_args()
     d = a.data_dir.rstrip("/")
     con = duckdb.connect()
@@ -78,95 +81,112 @@ def main():
       FROM events e;
     DELETE FROM ev_n WHERE n_treated + n_control = 0;
     DELETE FROM events WHERE event_id NOT IN (SELECT event_id FROM ev_n);
-    CREATE TEMP TABLE subj AS SELECT DISTINCT target FROM events;
     -- only list subscribers can be in an arm, so only their uptake is read
     CREATE TEMP TABLE subs AS SELECT DISTINCT u FROM lb;
-    CREATE TEMP TABLE win AS
-      SELECT target, MIN(t_add) - {W} AS lo, MAX(t_add) + {W} AS hi FROM events GROUP BY 1;
-    -- fresh artifacts at target level (event windows applied later)
-    CREATE TEMP TABLE art AS
-      SELECT p.did_id AS target, p.rkey, p.embed_external_uri AS url, TRY_CAST(p.created_at AS TIMESTAMPTZ) AS t_post
-      FROM '{d}/posts.parquet' p JOIN win w ON p.did_id = w.target
-      WHERE TRY_CAST(p.created_at AS TIMESTAMPTZ) >= w.lo AND TRY_CAST(p.created_at AS TIMESTAMPTZ) < w.hi;
-    -- uptake within H of the artifact, by anyone (u, target, rkey, t_post)
-    CREATE TEMP TABLE up_direct AS
-      SELECT r.did_id AS u, r.subject.did_id AS target, r.subject.rkey AS rkey,
-             TRY_CAST(r.created_at AS TIMESTAMPTZ) AS t_up
-      FROM '{d}/reposts.parquet' r
-      WHERE r.subject.did_id IN (SELECT target FROM subj) AND r.did_id IN (SELECT u FROM subs)
-      UNION ALL
-      SELECT q.did_id, q.embed_record.did_id, q.embed_record.rkey, TRY_CAST(q.created_at AS TIMESTAMPTZ)
-      FROM '{d}/posts.parquet' q
-      WHERE q.embed_record IS NOT NULL AND q.embed_record.did_id IN (SELECT target FROM subj)
-        AND q.did_id IN (SELECT u FROM subs);
-    CREATE TEMP TABLE hit_direct AS
-      SELECT DISTINCT d.u, a.target, a.rkey, a.t_post
-      FROM up_direct d JOIN art a ON d.target = a.target AND d.rkey = a.rkey
-      WHERE d.t_up BETWEEN a.t_post AND a.t_post + {H};
-    DROP TABLE up_direct;
-    CREATE TEMP TABLE art_url AS SELECT target, t_post, url FROM art WHERE url IS NOT NULL;
-    CREATE TEMP TABLE target_urls AS SELECT DISTINCT url FROM art_url;
-    CREATE TEMP TABLE up_copy AS
-      SELECT q.did_id AS u, q.embed_external_uri AS url, TRY_CAST(q.created_at AS TIMESTAMPTZ) AS t_up
-      FROM '{d}/posts.parquet' q
-      WHERE q.embed_external_uri IN (SELECT url FROM target_urls) AND q.did_id IN (SELECT u FROM subs);
-    CREATE TEMP TABLE first_url AS SELECT u, url, MIN(t_up) AS t_first FROM up_copy GROUP BY 1, 2;
-    CREATE TEMP TABLE hit_copy AS
-      SELECT DISTINCT c.u, a.target, a.rkey, a.t_post
-      FROM up_copy c JOIN art a ON c.url = a.url
-      JOIN first_url f ON f.u = c.u AND f.url = a.url
-      WHERE c.t_up BETWEEN a.t_post AND a.t_post + {H} AND f.t_first >= a.t_post;
-    DROP TABLE up_copy;
-    CREATE TEMP TABLE hits AS
-      SELECT u, target, rkey, t_post, 1 AS is_direct FROM hit_direct
-      UNION ALL SELECT u, target, rkey, t_post, 0 FROM hit_copy;
-    -- attach the uptaker's own subscriptions, then the events on those lists
-    CREATE TEMP TABLE hu AS SELECT DISTINCT u, target FROM hits;
-    CREATE TEMP TABLE cand AS
-      SELECT e.event_id, e.target, e.t_add, e.t_real, h.u,
-             CASE WHEN lb.t_sub <= e.t_real - {G} THEN 1 ELSE 0 END AS treated
-      FROM hu h JOIN lb ON lb.u = h.u JOIN events e ON e.list_key = lb.list_key AND e.target = h.target
-      WHERE lb.t_sub {ok} AND h.u <> e.target
-        AND (lb.t_sub <= e.t_real - {G} OR lb.t_sub > e.t_real + {W} + {CG});
-    -- other-route blocks, only for candidate (u, target)
-    CREATE TEMP TABLE cu AS SELECT DISTINCT u, target FROM cand;
-    CREATE TEMP TABLE other_block AS
-      SELECT b.did_id AS u, b.subject_id AS target, MIN(TRY_CAST(b.created_at AS TIMESTAMPTZ)) AS t
-      FROM '{d}/blocks.parquet' b SEMI JOIN cu ON cu.u = b.did_id AND cu.target = b.subject_id
-      GROUP BY 1, 2
-      UNION ALL
-      SELECT lb.u, li.target, GREATEST(lb.t_sub, li.t_add)
-      FROM cu JOIN lb ON lb.u = cu.u JOIN li ON li.list_key = lb.list_key AND li.target = cu.target;
-    DELETE FROM cand p WHERE EXISTS (
-      SELECT 1 FROM other_block o WHERE o.u = p.u AND o.target = p.target
-        AND o.t < p.t_add + {W} AND NOT (p.treated = 1 AND o.t >= p.t_add));
-    -- place each hit in its event's pre or post artifact window
-    CREATE TEMP TABLE panel AS
-      SELECT c.event_id, c.target, c.u, c.treated,
-             CASE WHEN h.t_post < c.t_add THEN 0 ELSE 1 END AS post,
-             SUM(h.is_direct)::BIGINT AS y_direct, SUM(1 - h.is_direct)::BIGINT AS y_copy,
-             NULL::BIGINT AS n_treated, NULL::BIGINT AS n_control, NULL::VARCHAR AS list_key,
-             NULL::TIMESTAMPTZ AS t_real, NULL::BIGINT AS n_url0, NULL::BIGINT AS n_url1
-      FROM cand c JOIN hits h ON h.u = c.u AND h.target = c.target
-      WHERE (h.t_post >= c.t_add - {W} AND h.t_post < c.t_add - {H})
-         OR (h.t_post >= c.t_add AND h.t_post < c.t_add + {W} - {H})
-      GROUP BY 1, 2, 3, 4, 5
-      UNION ALL
-      SELECT event_id, target, NULL, 1, 0, 0, 0, n_treated, n_control, list_key, t_real,
-        (SELECT COUNT(*) FROM art_url a WHERE a.target = ev_n.target
-           AND a.t_post >= ev_n.t_add - {W} AND a.t_post < ev_n.t_add - {H}),
-        (SELECT COUNT(*) FROM art_url a WHERE a.target = ev_n.target
-           AND a.t_post >= ev_n.t_add AND a.t_post < ev_n.t_add + {W} - {H})
-      FROM ev_n;
-    -- carry the event's list and time onto its uptake rows
-    UPDATE panel SET list_key = e.list_key, t_real = e.t_real
-      FROM ev_n e WHERE panel.u IS NOT NULL AND panel.event_id = e.event_id;
     """
     con.execute(q)
-    con.execute(f"COPY panel TO '{a.out}' (FORMAT parquet)")
-    print(con.execute("""
+    # Everything below depends only on the target and the target's own links, so it
+    # runs exactly per target bucket, which bounds memory and spill on the full snapshot.
+    bucket_tables = ("ev_b", "events_b", "subj", "win", "art", "hit_direct", "art_url", "target_urls",
+                     "first_url", "hit_copy", "hits", "hu", "cand", "cu", "other_block", "panel")
+    parts = a.out + ".parts"
+    os.makedirs(parts, exist_ok=True)
+    for b in range(a.buckets):
+        q = f"""
+        CREATE TEMP TABLE ev_b AS SELECT * FROM ev_n WHERE target % {a.buckets} = {b};
+        CREATE TEMP TABLE events_b AS SELECT * FROM events WHERE event_id IN (SELECT event_id FROM ev_b);
+        CREATE TEMP TABLE subj AS SELECT DISTINCT target FROM events_b;
+        CREATE TEMP TABLE win AS
+          SELECT target, MIN(t_add) - {W} AS lo, MAX(t_add) + {W} AS hi FROM events_b GROUP BY 1;
+        -- fresh artifacts at target level (event windows applied later)
+        CREATE TEMP TABLE art AS
+          SELECT p.did_id AS target, p.rkey, p.embed_external_uri AS url, TRY_CAST(p.created_at AS TIMESTAMPTZ) AS t_post
+          FROM '{d}/posts.parquet' p JOIN win w ON p.did_id = w.target
+          WHERE TRY_CAST(p.created_at AS TIMESTAMPTZ) >= w.lo AND TRY_CAST(p.created_at AS TIMESTAMPTZ) < w.hi;
+        -- uptake within H of the artifact, by anyone (u, target, rkey, t_post)
+        CREATE TEMP TABLE up_direct AS
+          SELECT r.did_id AS u, r.subject.did_id AS target, r.subject.rkey AS rkey,
+                 TRY_CAST(r.created_at AS TIMESTAMPTZ) AS t_up
+          FROM '{d}/reposts.parquet' r
+          WHERE r.subject.did_id IN (SELECT target FROM subj) AND r.did_id IN (SELECT u FROM subs)
+          UNION ALL
+          SELECT q.did_id, q.embed_record.did_id, q.embed_record.rkey, TRY_CAST(q.created_at AS TIMESTAMPTZ)
+          FROM '{d}/posts.parquet' q
+          WHERE q.embed_record IS NOT NULL AND q.embed_record.did_id IN (SELECT target FROM subj)
+            AND q.did_id IN (SELECT u FROM subs);
+        CREATE TEMP TABLE hit_direct AS
+          SELECT DISTINCT d.u, a.target, a.rkey, a.t_post
+          FROM up_direct d JOIN art a ON d.target = a.target AND d.rkey = a.rkey
+          WHERE d.t_up BETWEEN a.t_post AND a.t_post + {H};
+        DROP TABLE up_direct;
+        CREATE TEMP TABLE art_url AS SELECT target, t_post, url FROM art WHERE url IS NOT NULL;
+        CREATE TEMP TABLE target_urls AS SELECT DISTINCT url FROM art_url;
+        CREATE TEMP TABLE up_copy AS
+          SELECT q.did_id AS u, q.embed_external_uri AS url, TRY_CAST(q.created_at AS TIMESTAMPTZ) AS t_up
+          FROM '{d}/posts.parquet' q
+          WHERE q.embed_external_uri IN (SELECT url FROM target_urls) AND q.did_id IN (SELECT u FROM subs);
+        CREATE TEMP TABLE first_url AS SELECT u, url, MIN(t_up) AS t_first FROM up_copy GROUP BY 1, 2;
+        CREATE TEMP TABLE hit_copy AS
+          SELECT DISTINCT c.u, a.target, a.rkey, a.t_post
+          FROM up_copy c JOIN art a ON c.url = a.url
+          JOIN first_url f ON f.u = c.u AND f.url = a.url
+          WHERE c.t_up BETWEEN a.t_post AND a.t_post + {H} AND f.t_first >= a.t_post;
+        DROP TABLE up_copy;
+        CREATE TEMP TABLE hits AS
+          SELECT u, target, rkey, t_post, 1 AS is_direct FROM hit_direct
+          UNION ALL SELECT u, target, rkey, t_post, 0 FROM hit_copy;
+        -- attach the uptaker's own subscriptions, then the events on those lists
+        CREATE TEMP TABLE hu AS SELECT DISTINCT u, target FROM hits;
+        CREATE TEMP TABLE cand AS
+          SELECT e.event_id, e.target, e.t_add, e.t_real, h.u,
+                 CASE WHEN lb.t_sub <= e.t_real - {G} THEN 1 ELSE 0 END AS treated
+          FROM hu h JOIN lb ON lb.u = h.u JOIN events_b e ON e.list_key = lb.list_key AND e.target = h.target
+          WHERE lb.t_sub {ok} AND h.u <> e.target
+            AND (lb.t_sub <= e.t_real - {G} OR lb.t_sub > e.t_real + {W} + {CG});
+        -- other-route blocks, only for candidate (u, target)
+        CREATE TEMP TABLE cu AS SELECT DISTINCT u, target FROM cand;
+        CREATE TEMP TABLE other_block AS
+          SELECT b.did_id AS u, b.subject_id AS target, MIN(TRY_CAST(b.created_at AS TIMESTAMPTZ)) AS t
+          FROM '{d}/blocks.parquet' b SEMI JOIN cu ON cu.u = b.did_id AND cu.target = b.subject_id
+          GROUP BY 1, 2
+          UNION ALL
+          SELECT lb.u, li.target, GREATEST(lb.t_sub, li.t_add)
+          FROM cu JOIN lb ON lb.u = cu.u JOIN li ON li.list_key = lb.list_key AND li.target = cu.target;
+        DELETE FROM cand p WHERE EXISTS (
+          SELECT 1 FROM other_block o WHERE o.u = p.u AND o.target = p.target
+            AND o.t < p.t_add + {W} AND NOT (p.treated = 1 AND o.t >= p.t_add));
+        -- place each hit in its event's pre or post artifact window
+        CREATE TEMP TABLE panel AS
+          SELECT c.event_id, c.target, c.u, c.treated,
+                 CASE WHEN h.t_post < c.t_add THEN 0 ELSE 1 END AS post,
+                 SUM(h.is_direct)::BIGINT AS y_direct, SUM(1 - h.is_direct)::BIGINT AS y_copy,
+                 NULL::BIGINT AS n_treated, NULL::BIGINT AS n_control, NULL::VARCHAR AS list_key,
+                 NULL::TIMESTAMPTZ AS t_real, NULL::BIGINT AS n_url0, NULL::BIGINT AS n_url1
+          FROM cand c JOIN hits h ON h.u = c.u AND h.target = c.target
+          WHERE (h.t_post >= c.t_add - {W} AND h.t_post < c.t_add - {H})
+             OR (h.t_post >= c.t_add AND h.t_post < c.t_add + {W} - {H})
+          GROUP BY 1, 2, 3, 4, 5
+          UNION ALL
+          SELECT event_id, target, NULL, 1, 0, 0, 0, n_treated, n_control, list_key, t_real,
+            (SELECT COUNT(*) FROM art_url a WHERE a.target = ev_b.target
+               AND a.t_post >= ev_b.t_add - {W} AND a.t_post < ev_b.t_add - {H}),
+            (SELECT COUNT(*) FROM art_url a WHERE a.target = ev_b.target
+               AND a.t_post >= ev_b.t_add AND a.t_post < ev_b.t_add + {W} - {H})
+          FROM ev_b;
+        -- carry the event's list and time onto its uptake rows
+        UPDATE panel SET list_key = e.list_key, t_real = e.t_real
+          FROM ev_b e WHERE panel.u IS NOT NULL AND panel.event_id = e.event_id;
+        """
+        con.execute(q)
+        con.execute(f"COPY panel TO '{parts}/{b}.parquet' (FORMAT parquet)")
+        for t in bucket_tables:
+            con.execute(f"DROP TABLE {t}")
+        print(f"bucket {b + 1}/{a.buckets} done", flush=True)
+    con.execute(f"COPY (SELECT * FROM '{parts}/*.parquet') TO '{a.out}' (FORMAT parquet)")
+    shutil.rmtree(parts)
+    print(con.execute(f"""
       SELECT treated, post, SUM(y_direct) AS direct, SUM(y_copy) AS copied
-      FROM panel WHERE u IS NOT NULL GROUP BY 1, 2 ORDER BY 1, 2""").df().to_string(index=False))
+      FROM '{a.out}' WHERE u IS NOT NULL GROUP BY 1, 2 ORDER BY 1, 2""").df().to_string(index=False))
     print(con.execute("""SELECT COUNT(*) AS events, SUM(n_treated) AS treated_pairs,
       SUM(n_control) AS control_pairs FROM ev_n""").df().to_string(index=False))
 
