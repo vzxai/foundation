@@ -9,6 +9,7 @@ This tests whether a community boundary (a curator adding an account to a modera
 | Path | What it does |
 |---|---|
 | `pipeline/build_panel.py` | DuckDB: raw parquet → stacked event panel (event × subscriber × period). Reference version; too large for the full snapshot |
+| `pipeline/extract_slim.py` | Streams the snapshot once and keeps only rows a build can use (target posts in their windows; quotes, links and reposts by list subscribers) |
 | `pipeline/build_panel_sparse.py` | Same panel cells, built from uptake rows so the ~10.8B pairs are never formed. Use this on the real snapshot |
 | `pipeline/estimate.py` | Mantel–Haenszel horizon index per channel, with cluster-bootstrap CIs and the naive before/after for contrast |
 | `sim/simulate.py` | Synthetic data in the real schema, with confounders and a known effect. SYNTHETIC. |

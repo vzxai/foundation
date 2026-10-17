@@ -122,8 +122,10 @@ def main():
     CREATE TEMP TABLE panel AS
       SELECT pr.event_id, pr.target, pr.u, pr.treated, per.post,
              COALESCE(SUM(y.y_direct), 0) AS y_direct, COALESCE(SUM(y.y_copy), 0) AS y_copy,
-             COALESCE(MAX(n.n_art), 0) AS n_art, COALESCE(MAX(n.n_art_url), 0) AS n_art_url
+             COALESCE(MAX(n.n_art), 0) AS n_art, COALESCE(MAX(n.n_art_url), 0) AS n_art_url,
+             ANY_VALUE(e.list_key) AS list_key, ANY_VALUE(e.t_real) AS t_real
       FROM pairs pr CROSS JOIN (VALUES (0), (1)) per(post)
+      JOIN events e ON e.event_id = pr.event_id
       LEFT JOIN y ON y.event_id = pr.event_id AND y.u = pr.u AND y.post = per.post
       LEFT JOIN n_art n ON n.event_id = pr.event_id AND n.post = per.post
       GROUP BY 1, 2, 3, 4, 5;

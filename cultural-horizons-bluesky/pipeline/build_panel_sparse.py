@@ -70,7 +70,7 @@ def main():
         AND list_key IN (SELECT list_key FROM lb);
     -- arm sizes by counting, not by joining
     CREATE TEMP TABLE ev_n AS
-      SELECT e.event_id, e.target,
+      SELECT e.event_id, e.target, e.list_key, e.t_real, e.t_add,
         (SELECT COUNT(*) FROM lb WHERE lb.list_key = e.list_key AND lb.t_sub {ok}
            AND lb.u <> e.target AND lb.t_sub <= e.t_real - {G}) AS n_treated,
         (SELECT COUNT(*) FROM lb WHERE lb.list_key = e.list_key AND lb.t_sub {ok}
@@ -79,6 +79,8 @@ def main():
     DELETE FROM ev_n WHERE n_treated + n_control = 0;
     DELETE FROM events WHERE event_id NOT IN (SELECT event_id FROM ev_n);
     CREATE TEMP TABLE subj AS SELECT DISTINCT target FROM events;
+    -- only list subscribers can be in an arm, so only their uptake is read
+    CREATE TEMP TABLE subs AS SELECT DISTINCT u FROM lb;
     CREATE TEMP TABLE win AS
       SELECT target, MIN(t_add) - {W} AS lo, MAX(t_add) + {W} AS hi FROM events GROUP BY 1;
     -- fresh artifacts at target level (event windows applied later)
@@ -90,21 +92,24 @@ def main():
     CREATE TEMP TABLE up_direct AS
       SELECT r.did_id AS u, r.subject.did_id AS target, r.subject.rkey AS rkey,
              TRY_CAST(r.created_at AS TIMESTAMPTZ) AS t_up
-      FROM '{d}/reposts.parquet' r WHERE r.subject.did_id IN (SELECT target FROM subj)
+      FROM '{d}/reposts.parquet' r
+      WHERE r.subject.did_id IN (SELECT target FROM subj) AND r.did_id IN (SELECT u FROM subs)
       UNION ALL
       SELECT q.did_id, q.embed_record.did_id, q.embed_record.rkey, TRY_CAST(q.created_at AS TIMESTAMPTZ)
       FROM '{d}/posts.parquet' q
-      WHERE q.embed_record IS NOT NULL AND q.embed_record.did_id IN (SELECT target FROM subj);
+      WHERE q.embed_record IS NOT NULL AND q.embed_record.did_id IN (SELECT target FROM subj)
+        AND q.did_id IN (SELECT u FROM subs);
     CREATE TEMP TABLE hit_direct AS
       SELECT DISTINCT d.u, a.target, a.rkey, a.t_post
       FROM up_direct d JOIN art a ON d.target = a.target AND d.rkey = a.rkey
       WHERE d.t_up BETWEEN a.t_post AND a.t_post + {H};
     DROP TABLE up_direct;
-    CREATE TEMP TABLE target_urls AS SELECT DISTINCT url FROM art WHERE url IS NOT NULL;
+    CREATE TEMP TABLE art_url AS SELECT target, t_post, url FROM art WHERE url IS NOT NULL;
+    CREATE TEMP TABLE target_urls AS SELECT DISTINCT url FROM art_url;
     CREATE TEMP TABLE up_copy AS
       SELECT q.did_id AS u, q.embed_external_uri AS url, TRY_CAST(q.created_at AS TIMESTAMPTZ) AS t_up
       FROM '{d}/posts.parquet' q
-      WHERE q.embed_external_uri IN (SELECT url FROM target_urls);
+      WHERE q.embed_external_uri IN (SELECT url FROM target_urls) AND q.did_id IN (SELECT u FROM subs);
     CREATE TEMP TABLE first_url AS SELECT u, url, MIN(t_up) AS t_first FROM up_copy GROUP BY 1, 2;
     CREATE TEMP TABLE hit_copy AS
       SELECT DISTINCT c.u, a.target, a.rkey, a.t_post
@@ -140,13 +145,22 @@ def main():
       SELECT c.event_id, c.target, c.u, c.treated,
              CASE WHEN h.t_post < c.t_add THEN 0 ELSE 1 END AS post,
              SUM(h.is_direct)::BIGINT AS y_direct, SUM(1 - h.is_direct)::BIGINT AS y_copy,
-             NULL::BIGINT AS n_treated, NULL::BIGINT AS n_control
+             NULL::BIGINT AS n_treated, NULL::BIGINT AS n_control, NULL::VARCHAR AS list_key,
+             NULL::TIMESTAMPTZ AS t_real, NULL::BIGINT AS n_url0, NULL::BIGINT AS n_url1
       FROM cand c JOIN hits h ON h.u = c.u AND h.target = c.target
       WHERE (h.t_post >= c.t_add - {W} AND h.t_post < c.t_add - {H})
          OR (h.t_post >= c.t_add AND h.t_post < c.t_add + {W} - {H})
       GROUP BY 1, 2, 3, 4, 5
       UNION ALL
-      SELECT event_id, target, NULL, 1, 0, 0, 0, n_treated, n_control FROM ev_n;
+      SELECT event_id, target, NULL, 1, 0, 0, 0, n_treated, n_control, list_key, t_real,
+        (SELECT COUNT(*) FROM art_url a WHERE a.target = ev_n.target
+           AND a.t_post >= ev_n.t_add - {W} AND a.t_post < ev_n.t_add - {H}),
+        (SELECT COUNT(*) FROM art_url a WHERE a.target = ev_n.target
+           AND a.t_post >= ev_n.t_add AND a.t_post < ev_n.t_add + {W} - {H})
+      FROM ev_n;
+    -- carry the event's list and time onto its uptake rows
+    UPDATE panel SET list_key = e.list_key, t_real = e.t_real
+      FROM ev_n e WHERE panel.u IS NOT NULL AND panel.event_id = e.event_id;
     """
     con.execute(q)
     con.execute(f"COPY panel TO '{a.out}' (FORMAT parquet)")

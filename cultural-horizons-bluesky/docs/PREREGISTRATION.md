@@ -1,6 +1,6 @@
 # Cultural horizons, stage 2: do community boundaries trap fresh artifacts?
 
-Draft analysis plan, written 17 October 2026 **before any real data was analyzed**. It is not an external preregistration until deposited (e.g. OSF) with a timestamp. Freeze it there before running `build_panel.py` on real files.
+Analysis plan, written 17 October 2026 **before any real data was analyzed**, and amended the same day (§11) after a feasibility check that computed no outcomes (`docs/FEASIBILITY.md`). **Frozen by the git commit that adds §11, pushed before any outcome was computed.** That commit is the timestamp; it is not an OSF deposit.
 
 ## 1. Question
 
@@ -95,3 +95,17 @@ Use Mastodon/Pleroma defederation events with timestamps, from Colglazier, TeBlu
 - Whether ideas cross without a shared link (paraphrase, memes, images). The extension is image blob CIDs and embedding similarity, to be specified separately before use.
 - Long-run cultural divergence. HI is a two-week, single-artifact quantity.
 - Any *law* of horizons. A strong HI in one platform is a measured property of that boundary type, not a universal.
+
+## 11. Amendments before any outcome was computed (17 October 2026)
+
+These follow from `docs/FEASIBILITY.md`, which used list and block files only. Where they conflict with §§3–7, they win.
+
+1. **Panel build.** `pipeline/build_panel_sparse.py` replaces `build_panel.py` on real data. The full snapshot has ~10.8B event × subscriber pairs, which cannot be materialized. The sparse build gives identical per-event cells (`sim/check_sparse.py`). Only uptake by accounts that subscribe to some list is read, since no one else can be in an arm.
+2. **Primary CI clusters on lists**, not targets. One list's events share subscribers, and the ten largest lists hold 75% of pairs. Target clustering is reported as a sensitivity. The bootstrap uses multinomial cluster weights, which is the same resampling as before, vectorized. Re-run validation with list clustering (20 seeds each; only 24 lists, so a hard case): mean estimate 0.488 / −0.020 / 0.895 for true effects 0.5 / 0.0 / 0.9, coverage 95% / 95% / 90% (`sim/validation_results_SYNTHETIC.json`).
+3. **Lists.** The primary analysis excludes lists known to be `curatelist` or `referencelist`, since subscribing to them does not block. Lists missing from `lists.parquet` (likely deleted; 54% of subscription records) stay in the primary analysis. Sensitivity 3 becomes two analyses: (a) known `modlist` only; (b) known `modlist` whose curator has ≥ 50 subscribers across their lists.
+4. **Copy channel links** also include the external link of quote-with-media posts (`embed_media.external.uri`), which `embed_external_uri` leaves empty.
+5. **Added sensitivity: time split** at 2024-11-01 (T before vs on/after), since 93% of events follow that date.
+6. **Sensitivity 5 is dropped.** The snapshot has no account status, so suspended or deleted targets cannot be identified.
+7. **Sensitivity 1** is run one dimension at a time around the primary (W ∈ {7, 28} at H = 3; H ∈ {1, 7} at W = 14), not as a full 3 × 3 grid.
+8. **Added threat: private list mutes.** Mutes are not public. A control subscriber who muted the list before T is partly treated, which biases HI toward 0 in both channels.
+9. **Decision rules (§4) are unchanged.** H1 is judged on the primary (list-clustered) result.
