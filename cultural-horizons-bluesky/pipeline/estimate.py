@@ -65,8 +65,12 @@ def main():
     a = ap.parse_args()
     panel = pd.read_parquet(a.panel)
     rng = np.random.default_rng(a.seed)
+    if "n_treated" in panel:  # sparse panel from build_panel_sparse.py: pairs before exclusion
+        pairs = int(panel.n_treated.sum() + panel.n_control.sum())
+    else:
+        pairs = int(panel[["event_id", "u"]].drop_duplicates().shape[0])
     res = {"events": int(panel.event_id.nunique()), "targets": int(panel.target.nunique()),
-           "pairs": int(panel[["event_id", "u"]].drop_duplicates().shape[0])}
+           "pairs": pairs}
     for ch in CHANNELS:
         t = cells(panel, ch)
         r = mh_ratio(t)
