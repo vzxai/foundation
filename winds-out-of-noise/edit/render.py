@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "visuals"))
 sys.path.insert(0, HERE)
 import generative  # noqa: E402
-from timeline import SECTION_STYLE, SHOTS, TEXT  # noqa: E402
+from timeline import SECTION_STYLE, SHOTS, SOURCE_CROP, TEXT  # noqa: E402
 
 FPS = 30
 W, H = generative.W, generative.H
@@ -43,7 +43,7 @@ class Decoder:
         path = os.path.join(CACHE, src + ".mp4")
         geo = ("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:-1:-1" % (W, H, W, H)) if fit else \
               ("scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (W, H, W, H))
-        vf = crop + geo + ",setsar=1"
+        vf = SOURCE_CROP.get(src, "") + crop + geo + ",setsar=1"
         if speed != 1:
             vf += ",setpts=PTS/%g" % speed
         vf += ",fps=%d" % FPS
@@ -362,8 +362,8 @@ def render_range(args):
     ow, oh = int(W * scale) // 2 * 2, int(H * scale) // 2 * 2
     enc = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
                             "-s", "%dx%d" % (W, H), "-r", str(FPS), "-i", "-",
-                            "-vf", "scale=%d:%d" % (ow, oh), "-c:v", "libx264", "-preset", "medium",
-                            "-crf", "17", "-pix_fmt", "yuv420p", out_path], stdin=subprocess.PIPE)
+                            "-vf", "scale=%d:%d" % (ow, oh), "-c:v", "libx264",
+                            "-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p", out_path], stdin=subprocess.PIPE)
     live = {}
     prev = None
     f0, f1 = int(round(a * FPS)), int(round(b * FPS))

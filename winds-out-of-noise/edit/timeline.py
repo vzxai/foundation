@@ -25,7 +25,9 @@ def G(t, d, name, **params):
 
 
 SHOTS = []
-TEXT = []  # (t_in, t_out, style, text)
+TEXT = []
+# sources with burned-in marks to crop away wherever they are used (ffmpeg crop, before scaling)
+SOURCE_CROP = {"GSFC_20170412_Lights_m12573_EarthAtNight": "crop=iw*0.82:ih*0.82:iw*0.09:ih*0.12,"}  # (t_in, t_out, style, text)
 
 
 def text(t0, t1, style, s):
